@@ -19,95 +19,129 @@ local tpus = import 'templates/tpus.libsonnet';
 local utils = import 'templates/utils.libsonnet';
 
 {
-  local llama2-google-next-inference-pretrained-models = self.llama2-google-next-inference-pretrained-models,
-  llama2-google-next-inference-pretrained-models:: common.PyTorchTest {
+  local llama2_inference = self.llama2_inference,
+  llama2_inference:: common.PyTorchTest {
     local config = self,
-    modelName: 'llama2-model',
+    modelName: 'l2-i',
     paramsOverride:: {
-      scriptPath: 'example_text_completion.py',
+      scriptPath: 'llama/7B/llama2inference.sh',
       trainCommand: [
-        'torchrun --nproc_per_node 1',
+        'bash',
         self.scriptPath,
-        '--ckpt_dir llama-2-7b/',
-        '--tokenizer_path tokenizer.model',
-        '--max_seq_len 128 --max_batch_size 4',
       ],
     },
     command: self.paramsOverride.trainCommand,
   },
-  local llama2-google-next-inference-fine-tuned-chat-models = self.llama2-google-next-inference-fine-tuned-chat-models,
-  llama2-google-next-inference-fine-tuned-chat-models:: common.PyTorchTest {
+  local llama2_training = self.llama2_training,
+  llama2_training:: common.PyTorchTest {
     local config = self,
-    modelName: 'llama2-model',
+    modelName: 'l2-t',
     paramsOverride:: {
-      scriptPath: 'example_chat_completion.py',
+      scriptPath: 'llama/transformers/7B/llama2training.sh',
       trainCommand: [
-        'torchrun --nproc_per_node 1',
+        'bash',
         self.scriptPath,
-        '--ckpt_dir llama-2-7b-chat/',
-        '--tokenizer_path tokenizer.model',
-        '--max_seq_len 512 --max_batch_size 4',
       ],
     },
     command: self.paramsOverride.trainCommand,
   },
-  local llama2-stable-tokenizer = self.llama2-stable-tokenizer,
-  llama2-stable-tokenizer:: common.PyTorchTest {
-    local config = self,
-    modelName: 'llama2-model',
-    paramsOverride:: {
-      scriptPath: 'example.py',
-      trainCommand: [
-        'torchrun --nproc_per_node MP',
-        self.scriptPath,
-        '--ckpt_dir $TARGET_FOLDER/model_size',
-        '--tokenizer_path $TARGET_FOLDER/tokenizer.model',
-      ],
-    },
-    command: self.paramsOverride.trainCommand,
-  },
-  local llama2-stable-quant = self.llama2-stable-quant,
-  llama2-stable-quant:: common.PyTorchTest {
-    local config = self,
-    modelName: 'llama2-model',
-    paramsOverride:: {
-      scriptPath: 'example_xla.py',
-      trainCommand: [
-        'python3',
-        self.scriptPath,
-        '--tokenizer_path $TOKENIZER_PATH',
-        '--max_seq_len 256',
-        '--max_batch_size 1',
-        '--temperature 0.8',
-        '--dim 4096',
-        '--n_heads 32',
-        '--n_layers 32',
-        '--mp True',
-      ],
-    },
-    command: self.paramsOverride.trainCommand,
-  },
-  local llama2-google-next-inference = self.llama2-google-next-inference,
-  llama2-google-next-inference:: common.PyTorchTpuVmMixin {
-    modelName+: '-llama2-google-next-inference',
+  local pjrt = self.pjrt,
+  pjrt:: common.PyTorchTpuVmMixin {
+    modelName+: '-n-i',
     tpuSettings+: {
       tpuVmExtraSetup: |||
-        git clone -b llama2-google-next-inference https://github.com/pytorch-tpu/llama.git
+        pip3 uninstall torch torch_xla torchvision libtpu-nightly -y
+        sudo apt-get update -y
+        sudo apt-get install libomp5 -y
+        pip3 install mkl mkl-include
+        pip3 install tf-nightly tb-nightly tbp-nightly
+        pip3 install numpy
+        sudo apt-get install numactl -y
+        sudo apt-get install libopenblas-dev -y
+        pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-nightly-cp310-cp310-linux_x86_64.whl
+        pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-nightly-cp310-cp310-linux_x86_64.whl
+        pip3 install torch_xla[tpuvm]
+
+        # install tokenizer model
+        wget https://storage.googleapis.com/tpu-pytorch/lsiyuan-experiment/llama/spiece.model
+
+        # git clone and build llama
+        git clone --branch llama2-google-next-inference https://github.com/pytorch-tpu/llama.git
         cd llama
-        pip install -r requirements.txt
-        pip install -e .
+        pip3 install -r requirements.txt
+        pip3 install -e .
+
+        # 7B config
+        mkdir 7B
+        cd 7B/
+        echo -e '{"dim": 4096, "multiple_of": 256, "n_heads": 32, "n_layers": 32, "norm_eps": 1e-05, "vocab_size": -1}' >> params.json
+
+        # save llama2 test
+        echo -e 'python3 llama/example_text_completion.py True "/home/xl-ml-test/llama/7B" /home/xl-ml-test/spiece.model --max_seq_len=2048 --max_gen_len=1000 --max_batch_size=2 --dynamo=True > output.txt' >> llama2inference.sh
+        echo -e 'file = open("output.txt")' >> getvalue.py
+        echo -e 'content = file.readlines()' >> getvalue.py
+        echo -e 'warm_line = content[-6]' >> getvalue.py
+        echo -e 'warm_value = float((warm_line.split())[5])' >> getvalue.py
+        echo -e 'if warm_value > 7.948752 or warm_value < 7.191728:' >> getvalue.py
+        echo -e '    raise ValueError("warm latency/token exceeded throuhold 7.57024 +- 5%")' >> getvalue.py
+        echo -e 'else:' >> getvalue.py
+        echo -e '    print("Finished llama2 test and warm latency/token within expected throuhold 7.57024 +- 5%")' >> getvalue.py
+        echo -e 'cat output.txt' >> llama2inference.sh
+        echo -e 'python3 llama/7B/getvalue.py' >> llama2inference.sh
+        cat llama2inference.sh
       |||,
     },
   },
-  local stable = self.stable,
-  stable:: common.PyTorchTpuVmMixin {
-    modelName+: '-stable',
+  local hf = self.hf,
+  hf:: common.PyTorchTpuVmMixin {
+    modelName+: '-h-f',
     tpuSettings+: {
       tpuVmExtraSetup: |||
-        git clone -b stable https://github.com/pytorch-tpu/llama.git
+        pip3 uninstall torch torch_xla torchvision libtpu-nightly -y
+        sudo apt update -y
+        sudo apt-get update -y
+        pip install accelerate -U
+        sudo apt-get install libomp5 -y
+        pip3 install mkl mkl-include
+        pip3 install tf-nightly tb-nightly tbp-nightly
+        pip3 install numpy
+        sudo apt-get install numactl -y
+        sudo apt-get install libopenblas-dev -y
+        pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch-nightly-cp310-cp310-linux_x86_64.whl
+        pip3 install https://storage.googleapis.com/pytorch-xla-releases/wheels/tpuvm/torch_xla-nightly-cp310-cp310-linux_x86_64.whl
+        pip3 install torch_xla[tpuvm]
+
+        # install tokenizer model
+        wget https://storage.googleapis.com/tpu-pytorch/lsiyuan-experiment/llama/spiece.model
+
+        # git clone and build llama
+        git clone --branch llama2-google-next-inference https://github.com/pytorch-tpu/llama.git
         cd llama
-        pip install -r requirements.txt
-        pip install -e .
+        pip3 install -r requirements.txt
+        pip3 install -e .
+
+        # git clone and build transformers ### llama/transformers/
+        git clone -b lsiyuan/fsdp-data-aug https://github.com/pytorch-tpu/transformers.git
+        cd transformers
+        sudo pip3 uninstall transformers
+        sudo pip3 install -e .
+        pip3 install datasets
+        pip3 install evaluate
+        pip3 install scikit-learn
+        pip3 install accelerate
+        pwd
+        ls
+
+        # 7B config
+        mkdir 7B
+        cd 7B/
+        wget https://storage.googleapis.com/tpu-pytorch/lsiyuan-experiment/configs/hf_llama/7B.json
+
+        # save llama2 training
+        echo -e 'python3 -u llama/transformers/examples/pytorch/xla_spawn.py --num_cores 64 llama/transformers/examples/pytorch/language-modeling/run_clm.py    --num_train_epochs 2  --dataset_name wikitext     --dataset_config_name wikitext-2-raw-v1     --per_device_train_batch_size 8 --do_train --output_dir . --overwrite_output_dir --config_name llama/transformers/7B/7B.json --cache_dir /tmp --tokenizer_name gpt2 --block_size 1024 --optim adafactor --adafactor true  --save_strategy no --logging_strategy no' >> llama2training.sh
+        cat llama2training.sh
+        pwd
+        ls
       |||,
     },
   },
@@ -118,9 +152,7 @@ local utils = import 'templates/utils.libsonnet';
   },
 
   configs: [
-    // llama2-google-next-inference-pretrained-models + v4_8 + common.Functional + timeouts.Hours(3) + google-next-inference,
-    // llama2-google-next-inference-fine-tuned-chat-models + v4_8 + common.Functional + timeouts.Hours(3) + google-next-inference,
-    // llama2-stable-tokenizer + v4_8 + common.Functional + timeouts.Hours(3) + stable,
-    // llama2-stable-quant + v4_8 + common.Functional + timeouts.Hours(3) + stable,
+    llama2_inference + v4_8 + common.Functional + timeouts.Hours(3) + pjrt,
+    llama2_training + v4_8 + common.Functional + timeouts.Hours(3) + hf,
   ],
 }
